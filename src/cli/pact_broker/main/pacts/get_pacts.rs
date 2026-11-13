@@ -60,15 +60,26 @@ pub fn get_pacts(
             result
         };
 
+        // A single pact response is normalized into a one-row collection for the table
+        let single_pact = normalized_single_pact(&pacts_data);
+        let pacts_view = single_pact.as_ref().unwrap_or(&pacts_data);
+
         // Download pacts if requested
         if download {
-            download_pacts(&pacts_data, &hal_client, download_dir).await?;
+            if single_pact.is_some() {
+                // The response is the pact document itself, so there is nothing to fetch
+                create_download_dir(download_dir)?;
+                let consumer_name = pacts_data.pointer("/consumer/name").and_then(Value::as_str);
+                save_pact(&pacts_data, consumer_name, download_dir)?;
+            } else {
+                download_pacts(&pacts_data, &hal_client, download_dir).await?;
+            }
         }
 
         let output = match output_type {
             OutputType::Json => serde_json::to_string_pretty(&pacts_data).unwrap(),
-            OutputType::Table => generate_pacts_table(&pacts_data, consumer.is_some()),
-            OutputType::Text => generate_pacts_table(&pacts_data, consumer.is_some()),
+            OutputType::Table => generate_pacts_table(pacts_view, consumer.is_some()),
+            OutputType::Text => generate_pacts_table(pacts_view, consumer.is_some()),
             OutputType::Pretty => serde_json::to_string_pretty(&pacts_data).unwrap(),
         };
 
@@ -148,10 +159,7 @@ async fn download_pacts(
     hal_client: &HALClient,
     download_dir: &str,
 ) -> Result<(), PactBrokerError> {
-    // Create download directory if it doesn't exist
-    fs::create_dir_all(download_dir).map_err(|e| {
-        PactBrokerError::IoError(format!("Failed to create download directory: {}", e))
-    })?;
+    create_download_dir(download_dir)?;
 
     // Extract pacts array from the data
     let pacts: Vec<&Value> =
@@ -193,53 +201,99 @@ async fn download_pacts(
 
         // Download the pact content first to get the proper metadata
         let pact_content = hal_client.clone().fetch(pact_url).await?;
-
-        // Extract consumer and provider names from the downloaded pact content
-        let consumer_name = pact_content
-            .get("_links")
-            .and_then(|l| l.get("pb:consumer"))
-            .and_then(|c| c.get("name"))
-            .and_then(|n| n.as_str())
-            .or_else(|| pact.get("name").and_then(|n| n.as_str()))
-            .unwrap_or("unknown");
-
-        let provider_name = pact_content
-            .get("_links")
-            .and_then(|l| l.get("pb:provider"))
-            .and_then(|p| p.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("unknown");
-
-        let version = pact_content
-            .get("_links")
-            .and_then(|l| l.get("pb:consumer-version"))
-            .and_then(|v| v.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("unknown");
-
-        // Generate filename
-        let file_path = pact_file_path(download_dir, consumer_name, provider_name, version)?;
-
-        // Download the pact content
-        tracing::info!("Downloading pact: {}", file_path.display());
-
-        // Save to file
-        let content_str = serde_json::to_string_pretty(&pact_content).map_err(|e| {
-            PactBrokerError::ContentError(format!("Failed to serialize pact content: {}", e))
-        })?;
-
-        fs::write(&file_path, content_str).map_err(|e| {
-            PactBrokerError::IoError(format!(
-                "Failed to write pact file {}: {}",
-                file_path.display(),
-                e
-            ))
-        })?;
-
-        println!("  → {}", file_path.display());
+        save_pact(
+            &pact_content,
+            pact.get("name").and_then(|n| n.as_str()),
+            download_dir,
+        )?;
     }
 
     Ok(())
+}
+
+fn create_download_dir(download_dir: &str) -> Result<(), PactBrokerError> {
+    fs::create_dir_all(download_dir).map_err(|e| {
+        PactBrokerError::IoError(format!("Failed to create download directory: {}", e))
+    })
+}
+
+/// Writes a pact document into `download_dir`, naming the file from its
+/// `pb:consumer`, `pb:provider` and `pb:consumer-version` links.
+/// `fallback_consumer` names the consumer when the document has no `pb:consumer` link.
+fn save_pact(
+    pact_content: &Value,
+    fallback_consumer: Option<&str>,
+    download_dir: &str,
+) -> Result<(), PactBrokerError> {
+    let consumer_name = pact_content
+        .get("_links")
+        .and_then(|l| l.get("pb:consumer"))
+        .and_then(|c| c.get("name"))
+        .and_then(|n| n.as_str())
+        .or(fallback_consumer)
+        .unwrap_or("unknown");
+
+    let provider_name = pact_content
+        .get("_links")
+        .and_then(|l| l.get("pb:provider"))
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("unknown");
+
+    let version = pact_content
+        .get("_links")
+        .and_then(|l| l.get("pb:consumer-version"))
+        .and_then(|v| v.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("unknown");
+
+    // Generate filename
+    let file_path = pact_file_path(download_dir, consumer_name, provider_name, version)?;
+
+    tracing::info!("Saving pact: {}", file_path.display());
+
+    // Save to file
+    let content_str = serde_json::to_string_pretty(&pact_content).map_err(|e| {
+        PactBrokerError::ContentError(format!("Failed to serialize pact content: {}", e))
+    })?;
+
+    fs::write(&file_path, content_str).map_err(|e| {
+        PactBrokerError::IoError(format!(
+            "Failed to write pact file {}: {}",
+            file_path.display(),
+            e
+        ))
+    })?;
+
+    println!("  → {}", file_path.display());
+
+    Ok(())
+}
+
+/// Converts a single pact response (no `pacts` key, has `_links.self.href`) into
+/// `{"pacts": [{"name", "title", "href"}]}`. Returns `None` for any other response shape.
+fn normalized_single_pact(result: &Value) -> Option<Value> {
+    if result.get("pacts").is_some() {
+        return None;
+    }
+    let href = result.pointer("/_links/self/href")?.as_str()?;
+    let name = result
+        .pointer("/consumer/name")
+        .or_else(|| result.pointer("/_links/pb:consumer/name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let title = result
+        .pointer("/_links/self/title")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    Some(json!({
+        "pacts": [{
+            "name": name,
+            "title": title,
+            "href": href,
+        }]
+    }))
 }
 
 fn generate_pacts_table(result: &Value, _has_consumer_filter: bool) -> String {
@@ -342,6 +396,87 @@ mod get_pacts_tests {
         assert!(result.contains("Pact between TestConsumer and TestProvider"));
         assert!(result.contains(
             "http://example.org/pacts/provider/TestProvider/consumer/TestConsumer/latest"
+        ));
+    }
+
+    #[test]
+    fn test_normalized_single_pact() {
+        let single_pact = json!({
+            "consumer": { "name": "TestConsumer" },
+            "_links": {
+                "self": {
+                    "title": "Pact between TestConsumer (1.0.0) and TestProvider",
+                    "href": "http://example.org/pacts/provider/TestProvider/consumer/TestConsumer/version/1.0.0",
+                }
+            }
+        });
+
+        assert_eq!(
+            normalized_single_pact(&single_pact),
+            Some(json!({
+                "pacts": [
+                    {
+                        "name": "TestConsumer",
+                        "title": "Pact between TestConsumer (1.0.0) and TestProvider",
+                        "href": "http://example.org/pacts/provider/TestProvider/consumer/TestConsumer/version/1.0.0"
+                    }
+                ]
+            }))
+        );
+    }
+
+    #[test]
+    fn test_normalized_single_pact_falls_back_to_pb_consumer_name() {
+        let single_pact = json!({
+            "_links": {
+                "self": { "href": "http://example.org/pact"},
+                "pb:consumer": { "name": "LinkConsumer"}
+            }
+        });
+
+        assert_eq!(
+            normalized_single_pact(&single_pact),
+            Some(json!({
+                "pacts": [
+                    {
+                        "name": "LinkConsumer",
+                        "title": "",
+                        "href": "http://example.org/pact"
+                    }
+                ]
+            }))
+        );
+    }
+
+    #[test]
+    fn test_normalized_single_pact_returns_none_for_collection() {
+        let collection = json!({
+            "pacts": [],
+            "_links": { "self": { "href": "http://example.org/pacts" } }
+        });
+
+        assert_eq!(normalized_single_pact(&collection), None);
+    }
+
+    #[test]
+    fn test_generate_pacts_table_with_normalized_single_pact() {
+        let single_pact = json!({
+            "consumer": { "name": "TestConsumer" },
+            "_links": {
+                "self": {
+                    "title": "Pact between TestConsumer (1.0.0) and TestProvider",
+                    "href": "http://example.org/pacts/provider/TestProvider/consumer/TestConsumer/version/1.0.0",
+                }
+            }
+        });
+
+        let view = normalized_single_pact(&single_pact).unwrap();
+        let result = generate_pacts_table(&view, false);
+
+        assert!(result.contains("TestConsumer"));
+        assert!(result.contains("Pact between TestConsumer (1.0.0) and TestProvider"));
+        assert!(result.contains(
+            "http://example.org/pacts/provider/TestProvider/consumer/TestConsumer/version/1.0.0"
         ));
     }
 
@@ -674,6 +809,97 @@ mod get_pacts_tests {
         let output = result.unwrap();
         let output_json: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(output_json, expected_transformed_response);
+    }
+
+    #[test]
+    fn get_pacts_latest_for_consumer_and_branch_downloads_single_pact() {
+        // arrange - set up the pact mock server
+        let config = MockServerConfig {
+            pact_specification: PactSpecification::V2,
+            ..MockServerConfig::default()
+        };
+
+        let body = json!({
+            "consumer": { "name": "Condor" },
+            "provider": { "name": "Pricing Service" },
+            "interactions": [],
+            "metadata": { "pactSpecification": { "version": "2.0.0" } },
+            "_links": {
+                "self": {
+                    "title": "Pact between Condor (1.3.0) and Pricing Service",
+                    "href": "http://example.org/pacts/provider/Pricing%20Service/consumer/Condor/version/1.3.0"
+                },
+                "pb:consumer": { "name": "Condor" },
+                "pb:provider": { "name": "Pricing Service" },
+                "pb:consumer-version": { "name": "1.3.0" }
+            }
+        });
+
+        let pact_broker_service = PactBuilder::new("pact-broker-cli", "Pact Broker")
+            .interaction(
+                "a request to get the latest pact for provider and consumer on branch",
+                "",
+                |mut i| {
+                    i.given(
+                        "a pact between Condor and the Pricing Service exists with branch main",
+                    );
+                    i.request
+                        .get()
+                        .path(
+                            "/pacts/provider/Pricing%20Service/consumer/Condor/branch/main/latest",
+                        )
+                        .header("Accept", "application/hal+json")
+                        .header("Accept", "application/json");
+                    i.response
+                        .status(200)
+                        .header("Content-Type", "application/hal+json;charset=utf-8")
+                        .json_body(body.clone());
+                    i
+                },
+            )
+            .start_mock_server(None, Some(config));
+        let mock_server_url = pact_broker_service.url();
+
+        // arrange - set up the broker details and an empty download directory
+        let broker_details = BrokerDetails {
+            url: mock_server_url.to_string(),
+            auth: None,
+            ssl_options: SslOptions::default(),
+            custom_headers: None,
+            retries: 0,
+        };
+        let download_dir = std::env::temp_dir().join(format!(
+            "pact-broker-cli-get-pacts-single-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&download_dir);
+
+        // act
+        let result = get_pacts(
+            &broker_details,
+            "Pricing Service",
+            Some("Condor"),
+            Some("main"),
+            true,
+            OutputType::Table,
+            true,
+            download_dir.to_str().unwrap(),
+        );
+
+        // assert
+        let saved = fs::read_to_string(download_dir.join("Condor-Pricing Service-1.3.0.json"));
+        let _ = fs::remove_dir_all(&download_dir);
+
+        let output = result.expect("get_pacts should succeed for a single pact response");
+        assert!(output.contains("Condor"));
+        assert!(output.contains("Pact between Condor (1.3.0) and Pricing Service"));
+        assert!(output.contains(
+            "http://example.org/pacts/provider/Pricing%20Service/consumer/Condor/version/1.3.0"
+        ));
+
+        let saved: Value =
+            serde_json::from_str(&saved.expect("the single pact should be saved")).unwrap();
+        assert_eq!(saved, body);
     }
 
     #[test]
